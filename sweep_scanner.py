@@ -23,7 +23,7 @@ LOOKBACK = 20                # bars to find swing high/low
 ATR_PERIOD = 14
 ATR_MULTIPLIER = 0.3         # wick must exceed this × ATR
 COOLDOWN_BARS = 3            # bars before re-alerting same symbol
-TOP_N = 50
+TOP_N = 120
 # ────────────────────────────────────────────────────────
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:

@@ -1,7 +1,6 @@
 import asyncio
 import json
 import os
-import time
 from datetime import datetime, timezone
 
 import numpy as np
@@ -16,10 +15,10 @@ from telegram.constants import ParseMode
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-MEXC_FUTURES_WS = "wss://contract.mexc.com/ws"
-MEXC_TICKERS_URL = "https://contract.mexc.com/api/v1/contract/ticker"
+BINANCE_FUTURES_WS = "wss://fstream.binance.com/ws"
+BINANCE_TICKERS_URL = "https://fapi.binance.com/fapi/v1/ticker/24hr"
 
-TIMEFRAME = "Min60"          # 1-hour candles (MEXC uses Min60)
+TIMEFRAME = "1h"             # Binance interval code for 1-hour
 LOOKBACK = 20                # bars to find swing high/low
 ATR_PERIOD = 14
 ATR_MULTIPLIER = 0.3         # wick must exceed this × ATR
@@ -39,11 +38,13 @@ last_alert_bar: dict[str, int] = {}
 
 def fetch_top_symbols(n: int = TOP_N) -> list[str]:
     """Return top N perpetual symbols by 24h volume."""
-    resp = requests.get(MEXC_TICKERS_URL, timeout=10)
+    resp = requests.get(BINANCE_TICKERS_URL, timeout=10)
     resp.raise_for_status()
     data = resp.json()
-    tickers = data.get("data", [])
-    tickers.sort(key=lambda x: float(x.get("volume24", 0)), reverse=True)
+    
+    # Filter for USDT pairs and sort by quoteVolume (USDT volume)
+    tickers = [t for t in data if t.get("symbol", "").endswith("USDT")]
+    tickers.sort(key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
     symbols = [t["symbol"] for t in tickers[:n]]
     print(f"[+] Top {n} symbols: {symbols}")
     return symbols
@@ -106,7 +107,7 @@ def detect_liquidity_sweep(symbol: str, candles: list[dict]) -> dict | None:
 
 async def send_alert(details: dict):
     """Send a formatted Telegram alert."""
-    ts = datetime.fromtimestamp(details["time"], tz=timezone.utc).strftime(
+    ts = datetime.fromtimestamp(details["time"] / 1000, tz=timezone.utc).strftime(
         "%Y-%m-%d %H:%M UTC"
     )
     direction = details["direction"]
@@ -135,62 +136,69 @@ async def send_alert(details: dict):
 
 
 async def handle_kline_message(raw: str):
-    """Process incoming kline WebSocket messages."""
+    """Process incoming kline WebSocket messages from Binance."""
     try:
         msg = json.loads(raw)
     except json.JSONDecodeError:
         return
-    channel = msg.get("channel", "")
-    if channel != "push.kline":
+
+    # Binance kline event
+    if msg.get("e") != "kline":
         return
-    data = msg.get("data")
-    if not data:
+
+    kline = msg.get("k")
+    if not kline or not kline.get("x"):  # 'x' is true only when the kline is closed
         return
-    symbol = data.get("symbol")
-    if not symbol:
-        return
+
+    symbol = msg.get("s")
     candle = {
-        "time": data.get("t"),
-        "open": float(data.get("o", 0)),
-        "high": float(data.get("h", 0)),
-        "low": float(data.get("l", 0)),
-        "close": float(data.get("c", 0)),
+        "time": kline["t"],
+        "open": float(kline["o"]),
+        "high": float(kline["h"]),
+        "low": float(kline["l"]),
+        "close": float(kline["c"]),
     }
+
     store = candle_store.setdefault(symbol, [])
-    if store and store[-1]["time"] == candle["time"]:
-        store[-1] = candle
-        return
     store.append(candle)
+
+    # Keep only last ~100 candles to bound memory
     if len(store) > 100:
         candle_store[symbol] = store[-100:]
-    if len(store) >= 2:
-        closed_list = store[:-1]
-        if len(closed_list) >= LOOKBACK + ATR_PERIOD + 2:
-            result = detect_liquidity_sweep(symbol, closed_list)
-            if result:
-                bar_index = len(store)
-                last = last_alert_bar.get(symbol, -999)
-                if bar_index - last >= COOLDOWN_BARS:
-                    last_alert_bar[symbol] = bar_index
-                    asyncio.create_task(send_alert(result))
+
+    # Evaluate the newest closed candle
+    if len(store) >= LOOKBACK + ATR_PERIOD + 2:
+        result = detect_liquidity_sweep(symbol, store)
+        if result:
+            bar_index = len(store)
+            last = last_alert_bar.get(symbol, -999)
+            if bar_index - last >= COOLDOWN_BARS:
+                last_alert_bar[symbol] = bar_index
+                asyncio.create_task(send_alert(result))
 
 
 async def subscribe_symbols(symbols: list[str]):
-    """Connect to MEXC WebSocket and subscribe to 1H klines."""
-    async with websockets.connect(MEXC_FUTURES_WS, ping_interval=20) as ws:
+    """Connect to Binance WebSocket and subscribe to 1H klines."""
+    async with websockets.connect(BINANCE_FUTURES_WS, ping_interval=20) as ws:
+        # Subscribe to kline streams
         for sym in symbols:
             sub_msg = {
-                "method": "sub.kline",
-                "param": {"symbol": sym, "interval": TIMEFRAME},
+                "method": "SUBSCRIBE",
+                "params": [f"{sym.lower()}@kline_{TIMEFRAME}"],
+                "id": 1,
             }
             await ws.send(json.dumps(sub_msg))
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.05)  # avoid rate-limit bursts
+
         print(f"[+] Subscribed to {len(symbols)} symbols on {TIMEFRAME}")
+
+        # Listen for messages
         while True:
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=60)
                 await handle_kline_message(raw)
             except asyncio.TimeoutError:
+                # Send ping to keep alive
                 await ws.send(json.dumps({"method": "ping"}))
             except websockets.ConnectionClosed:
                 print("[!] WebSocket closed. Reconnecting...")
@@ -220,7 +228,6 @@ async def start_web_server():
     app.router.add_get("/", health_check)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Render provides PORT environment variable (default 10000)
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()

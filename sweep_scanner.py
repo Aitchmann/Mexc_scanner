@@ -24,8 +24,15 @@ LOOKBACK = 20                # bars to find swing high/low
 ATR_PERIOD = 14
 ATR_MULTIPLIER = 0.3         # wick must exceed this × ATR
 COOLDOWN_BARS = 3            # bars before re-alerting same symbol
-TOP_N = 120                   # You changed this to 120
+TOP_N = 120                  # You changed this to 120
 # ────────────────────────────────────────────────────────
+
+# Browser-like User-Agent to reduce chance of IP-based blocking
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120.0.0.0 Safari/537.36"
+}
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
     raise ValueError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set.")
@@ -44,7 +51,8 @@ def fetch_top_symbols(n: int = TOP_N) -> list[str]:
     # Construct the proxied URL for the REST API
     proxied_url = f"{PROXY_URL}/?target={MEXC_TICKERS_URL}"
     
-    resp = requests.get(proxied_url, timeout=15)
+    # Apply the browser headers here
+    resp = requests.get(proxied_url, headers=HTTP_HEADERS, timeout=15)
     resp.raise_for_status()
     data = resp.json()
     tickers = data.get("data", [])
@@ -198,7 +206,7 @@ async def handle_kline_message(raw: str):
 
 async def subscribe_symbols(symbols: list[str]):
     """Connect to MEXC WebSocket via Cloudflare Worker proxy."""
-    # FIX: Replace https:// with wss:// to satisfy the websockets library
+    # Replace https:// with wss:// to satisfy the websockets library
     ws_base = PROXY_URL.replace("https://", "wss://")
     proxied_ws_url = f"{ws_base}/?target={MEXC_FUTURES_WS}"
 
@@ -235,6 +243,9 @@ async def main_scanner():
             await subscribe_symbols(symbols)
         except Exception as e:
             print(f"[!] Error: {e}")
+            print("[*] Waiting 60 seconds before retrying to avoid rate limits...")
+            await asyncio.sleep(60)  # Increased delay to let blocks expire
+            continue
         print("[*] Reconnecting in 10 seconds...")
         await asyncio.sleep(10)
 

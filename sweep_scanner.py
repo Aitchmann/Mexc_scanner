@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import urllib.parse
 from datetime import datetime, timezone
 
 import numpy as np
@@ -22,9 +23,9 @@ MEXC_TICKERS_URL = "https://contract.mexc.com/api/v1/contract/ticker"
 TIMEFRAME = "Min60"          # 1-hour candles (MEXC uses Min60)
 LOOKBACK = 20                # bars to find swing high/low
 ATR_PERIOD = 14
-ATR_MULTIPLIER = 0.2         # wick must exceed this × ATR
+ATR_MULTIPLIER = 0.2         # You changed this to 0.2
 COOLDOWN_BARS = 3            # bars before re-alerting same symbol
-TOP_N = 80                   # Reduced from 120 to prevent WAF blocks
+TOP_N = 80                   # You changed this to 80
 # ────────────────────────────────────────────────────────
 
 # Full browser headers to bypass MEXC's Web Application Firewall
@@ -52,19 +53,63 @@ last_alert_bar: dict[str, int] = {}
 
 def fetch_top_symbols(n: int = TOP_N) -> list[str]:
     """Return top N perpetual symbols by 24h volume from MEXC via Cloudflare Proxy."""
-    # Construct the proxied URL for the REST API
     proxied_url = f"{PROXY_URL}/?target={MEXC_TICKERS_URL}"
     
-    # Apply the browser headers here
     resp = requests.get(proxied_url, headers=HTTP_HEADERS, timeout=15)
     resp.raise_for_status()
     data = resp.json()
     tickers = data.get("data", [])
-    # Sort descending by volume24
     tickers.sort(key=lambda x: float(x.get("volume24", 0)), reverse=True)
     symbols = [t["symbol"] for t in tickers[:n]]
     print(f"[+] Top {n} symbols: {symbols}")
     return symbols
+
+
+async def bootstrap_history(symbols: list[str]):
+    """Fetch historical 1H candles for all symbols to prime the memory instantly."""
+    print(f"[*] Bootstrapping historical candles for {len(symbols)} symbols...")
+    
+    for sym in symbols:
+        try:
+            # MEXC historical kline endpoint (limit 50 to cover the 36 needed)
+            kline_url = f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval={TIMEFRAME}&limit=50"
+            # URL-encode the target so the nested '?' doesn't break the proxy query string
+            encoded_target = urllib.parse.quote(kline_url, safe='')
+            proxied_url = f"{PROXY_URL}/?target={encoded_target}"
+            
+            resp = requests.get(proxied_url, headers=HTTP_HEADERS, timeout=15)
+            resp.raise_for_status()
+            data = resp.json().get("data", {})
+            
+            times = data.get("time", [])
+            opens = data.get("open", [])
+            highs = data.get("high", [])
+            lows = data.get("low", [])
+            closes = data.get("close", [])
+            
+            if not times:
+                continue
+                
+            candles = []
+            for i in range(len(times)):
+                candles.append({
+                    "time": int(times[i]),
+                    "open": float(opens[i]),
+                    "high": float(highs[i]),
+                    "low": float(lows[i]),
+                    "close": float(closes[i])
+                })
+            
+            candle_store[sym] = candles
+            print(f"[+] Bootstrapped {len(candles)} candles for {sym}")
+            
+            # Small delay to avoid hitting rate limits during the bulk fetch
+            await asyncio.sleep(0.1)
+            
+        except Exception as e:
+            print(f"[!] Failed to bootstrap {sym}: {e}")
+            
+    print("[*] Bootstrap complete. Starting WebSocket subscription...")
 
 
 def compute_atr(candles: list[dict], period: int = ATR_PERIOD) -> float:
@@ -94,7 +139,6 @@ def detect_liquidity_sweep(symbol: str, candles: list[dict]) -> dict | None:
     if atr == 0:
         return None
 
-    # Bullish sweep (swept a low, closed back above)
     if current["low"] < swing_low - (atr * ATR_MULTIPLIER):
         if current["close"] > swing_low:
             return {
@@ -107,7 +151,6 @@ def detect_liquidity_sweep(symbol: str, candles: list[dict]) -> dict | None:
                 "time": current["time"],
             }
 
-    # Bearish sweep (swept a high, closed back below)
     if current["high"] > swing_high + (atr * ATR_MULTIPLIER):
         if current["close"] < swing_high:
             return {
@@ -124,7 +167,6 @@ def detect_liquidity_sweep(symbol: str, candles: list[dict]) -> dict | None:
 
 async def send_alert(details: dict):
     """Send a formatted Telegram alert."""
-    # MEXC timestamps are in seconds
     ts = datetime.fromtimestamp(details["time"], tz=timezone.utc).strftime(
         "%Y-%m-%d %H:%M UTC"
     )
@@ -160,7 +202,6 @@ async def handle_kline_message(raw: str):
     except json.JSONDecodeError:
         return
 
-    # MEXC push format: {"channel":"push.kline","data":{...}}
     channel = msg.get("channel", "")
     if channel != "push.kline":
         return
@@ -174,7 +215,7 @@ async def handle_kline_message(raw: str):
         return
 
     candle = {
-        "time": data.get("t"),  # MEXC sends seconds
+        "time": data.get("t"),
         "open": float(data.get("o", 0)),
         "high": float(data.get("h", 0)),
         "low": float(data.get("l", 0)),
@@ -183,15 +224,11 @@ async def handle_kline_message(raw: str):
 
     store = candle_store.setdefault(symbol, [])
 
-    # If the same candle timestamp is received, it's still forming.
-    # Replace it so our last entry is always the newest.
     if store and store[-1]["time"] == candle["time"]:
         store[-1] = candle
         return
     else:
-        # A new candle has started. The previous one is now closed.
         if store:
-            # Run detection on the just-closed candle
             if len(store) >= LOOKBACK + ATR_PERIOD + 2:
                 result = detect_liquidity_sweep(symbol, store)
                 if result:
@@ -203,36 +240,31 @@ async def handle_kline_message(raw: str):
 
     store.append(candle)
 
-    # Keep only last ~100 candles to bound memory
     if len(store) > 100:
         candle_store[symbol] = store[-100:]
 
 
 async def subscribe_symbols(symbols: list[str]):
     """Connect to MEXC WebSocket via Cloudflare Worker proxy."""
-    # Replace https:// with wss:// to satisfy the websockets library
     ws_base = PROXY_URL.replace("https://", "wss://")
     proxied_ws_url = f"{ws_base}/?target={MEXC_FUTURES_WS}"
 
     async with websockets.connect(proxied_ws_url, ping_interval=20) as ws:
-        # Subscribe to kline streams
         for sym in symbols:
             sub_msg = {
                 "method": "sub.kline",
                 "param": {"symbol": sym, "interval": TIMEFRAME},
             }
             await ws.send(json.dumps(sub_msg))
-            await asyncio.sleep(0.05)  # avoid rate-limit bursts
+            await asyncio.sleep(0.05)
 
         print(f"[+] Subscribed to {len(symbols)} symbols on {TIMEFRAME}")
 
-        # Listen for messages
         while True:
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=60)
                 await handle_kline_message(raw)
             except asyncio.TimeoutError:
-                # Send ping to keep alive
                 await ws.send(json.dumps({"method": "ping"}))
             except websockets.ConnectionClosed:
                 print("[!] WebSocket closed. Reconnecting...")
@@ -244,11 +276,12 @@ async def main_scanner():
     while True:
         try:
             symbols = fetch_top_symbols(TOP_N)
+            await bootstrap_history(symbols)  # <-- NEW: Prime the memory instantly
             await subscribe_symbols(symbols)
         except Exception as e:
             print(f"[!] Error: {e}")
             print("[*] Waiting 60 seconds before retrying to avoid rate limits...")
-            await asyncio.sleep(60)  # Increased delay to let blocks expire
+            await asyncio.sleep(60)
             continue
         print("[*] Reconnecting in 10 seconds...")
         await asyncio.sleep(10)
@@ -265,7 +298,6 @@ async def start_web_server():
     app.router.add_get("/", health_check)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Render provides PORT environment variable (default 10000)
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()

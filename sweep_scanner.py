@@ -15,16 +15,23 @@ from telegram.constants import ParseMode
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-BINANCE_FUTURES_WS = "wss://fstream.binance.com/ws"
-BINANCE_TICKERS_URL = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+OKX_WS_URL = "wss://ws.okx.com:8443/ws/v5/public"
+OKX_TICKERS_URL = "https://www.okx.com/api/v5/market/tickers"
 
-TIMEFRAME = "1h"             # Binance interval code for 1-hour
+TIMEFRAME = "1H"             # OKX interval code for 1-hour
 LOOKBACK = 20                # bars to find swing high/low
 ATR_PERIOD = 14
 ATR_MULTIPLIER = 0.3         # wick must exceed this × ATR
 COOLDOWN_BARS = 3            # bars before re-alerting same symbol
 TOP_N = 120
 # ────────────────────────────────────────────────────────
+
+# Browser-like User-Agent to reduce chance of IP-based blocking
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120.0.0.0 Safari/537.36"
+}
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
     raise ValueError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set.")
@@ -37,15 +44,19 @@ last_alert_bar: dict[str, int] = {}
 
 
 def fetch_top_symbols(n: int = TOP_N) -> list[str]:
-    """Return top N perpetual symbols by 24h volume."""
-    resp = requests.get(BINANCE_TICKERS_URL, timeout=10)
+    """Return top N perpetual symbols by 24h volume from OKX."""
+    params = {"instType": "SWAP"}
+    resp = requests.get(
+        OKX_TICKERS_URL, params=params, headers=HTTP_HEADERS, timeout=10
+    )
     resp.raise_for_status()
     data = resp.json()
-    
-    # Filter for USDT pairs and sort by quoteVolume (USDT volume)
-    tickers = [t for t in data if t.get("symbol", "").endswith("USDT")]
-    tickers.sort(key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
-    symbols = [t["symbol"] for t in tickers[:n]]
+
+    tickers = data.get("data", [])
+    # Filter for USDT-margined perpetuals and sort by 24h volume in USDT
+    usdt_perps = [t for t in tickers if t.get("instId", "").endswith("USDT-SWAP")]
+    usdt_perps.sort(key=lambda x: float(x.get("volCcy24h", 0)), reverse=True)
+    symbols = [t["instId"] for t in usdt_perps[:n]]
     print(f"[+] Top {n} symbols: {symbols}")
     return symbols
 
@@ -136,30 +147,49 @@ async def send_alert(details: dict):
 
 
 async def handle_kline_message(raw: str):
-    """Process incoming kline WebSocket messages from Binance."""
+    """Process incoming kline WebSocket messages from OKX."""
     try:
         msg = json.loads(raw)
     except json.JSONDecodeError:
         return
 
-    # Binance kline event
-    if msg.get("e") != "kline":
+    # OKX sends a "event" field for subscription confirmations, ignore those
+    if "event" in msg:
         return
 
-    kline = msg.get("k")
-    if not kline or not kline.get("x"):  # 'x' is true only when the kline is closed
+    arg = msg.get("arg", {})
+    if not arg.get("channel", "").startswith("candle"):
         return
 
-    symbol = msg.get("s")
+    data = msg.get("data", [])
+    if not data:
+        return
+
+    # OKX candle format: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
+    kline = data[0]
+    symbol = arg.get("instId")
+    if not symbol:
+        return
+
+    # Only process confirmed (closed) candles
+    # confirm: "1" = closed, "0" = still forming
+    if len(kline) < 9 or kline[8] != "1":
+        return
+
     candle = {
-        "time": kline["t"],
-        "open": float(kline["o"]),
-        "high": float(kline["h"]),
-        "low": float(kline["l"]),
-        "close": float(kline["c"]),
+        "time": int(kline[0]),
+        "open": float(kline[1]),
+        "high": float(kline[2]),
+        "low": float(kline[3]),
+        "close": float(kline[4]),
     }
 
     store = candle_store.setdefault(symbol, [])
+
+    # Avoid duplicate entries for the same closed candle
+    if store and store[-1]["time"] == candle["time"]:
+        return
+
     store.append(candle)
 
     # Keep only last ~100 candles to bound memory
@@ -178,18 +208,18 @@ async def handle_kline_message(raw: str):
 
 
 async def subscribe_symbols(symbols: list[str]):
-    """Connect to Binance WebSocket and subscribe to 1H klines."""
-    async with websockets.connect(BINANCE_FUTURES_WS, ping_interval=20) as ws:
-        # Subscribe to kline streams
+    """Connect to OKX WebSocket and subscribe to 1H klines."""
+    async with websockets.connect(OKX_WS_URL, ping_interval=20) as ws:
+        # OKX allows batching multiple channels in one subscribe request.
+        # Build subscription args for all symbols.
+        args = []
         for sym in symbols:
-            sub_msg = {
-                "method": "SUBSCRIBE",
-                "params": [f"{sym.lower()}@kline_{TIMEFRAME}"],
-                "id": 1,
-            }
-            await ws.send(json.dumps(sub_msg))
-            await asyncio.sleep(0.05)  # avoid rate-limit bursts
+            args.append({"channel": f"candle{TIMEFRAME}", "instId": sym})
 
+        # OKX limits total subscribe/unsubscribe/login to 480 per connection.
+        # Sending one large batch is most efficient.
+        sub_msg = {"op": "subscribe", "args": args}
+        await ws.send(json.dumps(sub_msg))
         print(f"[+] Subscribed to {len(symbols)} symbols on {TIMEFRAME}")
 
         # Listen for messages
@@ -199,7 +229,7 @@ async def subscribe_symbols(symbols: list[str]):
                 await handle_kline_message(raw)
             except asyncio.TimeoutError:
                 # Send ping to keep alive
-                await ws.send(json.dumps({"method": "ping"}))
+                await ws.send(json.dumps({"op": "ping"}))
             except websockets.ConnectionClosed:
                 print("[!] WebSocket closed. Reconnecting...")
                 break

@@ -24,7 +24,7 @@ LOOKBACK = 20                # bars to find swing high/low
 ATR_PERIOD = 14
 ATR_MULTIPLIER = 0.3         # wick must exceed this × ATR
 COOLDOWN_BARS = 3            # bars before re-alerting same symbol
-TOP_N = 120
+TOP_N = 120                   # You changed this to 120
 # ────────────────────────────────────────────────────────
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -41,7 +41,7 @@ last_alert_bar: dict[str, int] = {}
 
 def fetch_top_symbols(n: int = TOP_N) -> list[str]:
     """Return top N perpetual symbols by 24h volume from MEXC via Cloudflare Proxy."""
-    # Construct the proxied URL
+    # Construct the proxied URL for the REST API
     proxied_url = f"{PROXY_URL}/?target={MEXC_TICKERS_URL}"
     
     resp = requests.get(proxied_url, timeout=15)
@@ -198,8 +198,9 @@ async def handle_kline_message(raw: str):
 
 async def subscribe_symbols(symbols: list[str]):
     """Connect to MEXC WebSocket via Cloudflare Worker proxy."""
-    # Construct the proxied WebSocket URL
-    proxied_ws_url = f"{PROXY_URL}/?target={MEXC_FUTURES_WS}"
+    # FIX: Replace https:// with wss:// to satisfy the websockets library
+    ws_base = PROXY_URL.replace("https://", "wss://")
+    proxied_ws_url = f"{ws_base}/?target={MEXC_FUTURES_WS}"
 
     async with websockets.connect(proxied_ws_url, ping_interval=20) as ws:
         # Subscribe to kline streams

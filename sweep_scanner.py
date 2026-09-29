@@ -22,16 +22,20 @@ MEXC_TICKERS_URL = "https://contract.mexc.com/api/v1/contract/ticker"
 TIMEFRAME = "Min60"          # 1-hour candles (MEXC uses Min60)
 LOOKBACK = 20                # bars to find swing high/low
 ATR_PERIOD = 14
-ATR_MULTIPLIER = 0.01         # wick must exceed this × ATR
+ATR_MULTIPLIER = 0.2         # wick must exceed this × ATR
 COOLDOWN_BARS = 3            # bars before re-alerting same symbol
-TOP_N = 120                  # You changed this to 120
+TOP_N = 80                   # Reduced from 120 to prevent WAF blocks
 # ────────────────────────────────────────────────────────
 
-# Browser-like User-Agent to reduce chance of IP-based blocking
+# Full browser headers to bypass MEXC's Web Application Firewall
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/120.0.0.0 Safari/537.36"
+                  "Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.mexc.com/",
+    "Connection": "keep-alive"
 }
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:

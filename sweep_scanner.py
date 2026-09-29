@@ -15,23 +15,16 @@ from telegram.constants import ParseMode
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-OKX_WS_URL = "wss://ws.okx.com:8443/ws/v5/public"
-OKX_TICKERS_URL = "https://www.okx.com/api/v5/market/tickers"
+MEXC_FUTURES_WS = "wss://contract.mexc.com/ws"
+MEXC_TICKERS_URL = "https://contract.mexc.com/api/v1/contract/ticker"
 
-TIMEFRAME = "1H"             # OKX interval code for 1-hour
+TIMEFRAME = "Min60"          # 1-hour candles (MEXC uses Min60)
 LOOKBACK = 20                # bars to find swing high/low
 ATR_PERIOD = 14
 ATR_MULTIPLIER = 0.3         # wick must exceed this × ATR
 COOLDOWN_BARS = 3            # bars before re-alerting same symbol
 TOP_N = 120
 # ────────────────────────────────────────────────────────
-
-# Browser-like User-Agent to reduce chance of IP-based blocking
-HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/120.0.0.0 Safari/537.36"
-}
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
     raise ValueError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set.")
@@ -44,19 +37,14 @@ last_alert_bar: dict[str, int] = {}
 
 
 def fetch_top_symbols(n: int = TOP_N) -> list[str]:
-    """Return top N perpetual symbols by 24h volume from OKX."""
-    params = {"instType": "SWAP"}
-    resp = requests.get(
-        OKX_TICKERS_URL, params=params, headers=HTTP_HEADERS, timeout=10
-    )
+    """Return top N perpetual symbols by 24h volume from MEXC."""
+    resp = requests.get(MEXC_TICKERS_URL, timeout=10)
     resp.raise_for_status()
     data = resp.json()
-
     tickers = data.get("data", [])
-    # Filter for USDT-margined perpetuals and sort by 24h volume in USDT
-    usdt_perps = [t for t in tickers if t.get("instId", "").endswith("USDT-SWAP")]
-    usdt_perps.sort(key=lambda x: float(x.get("volCcy24h", 0)), reverse=True)
-    symbols = [t["instId"] for t in usdt_perps[:n]]
+    # Sort descending by volume24
+    tickers.sort(key=lambda x: float(x.get("volume24", 0)), reverse=True)
+    symbols = [t["symbol"] for t in tickers[:n]]
     print(f"[+] Top {n} symbols: {symbols}")
     return symbols
 
@@ -118,7 +106,8 @@ def detect_liquidity_sweep(symbol: str, candles: list[dict]) -> dict | None:
 
 async def send_alert(details: dict):
     """Send a formatted Telegram alert."""
-    ts = datetime.fromtimestamp(details["time"] / 1000, tz=timezone.utc).strftime(
+    # MEXC timestamps are in seconds
+    ts = datetime.fromtimestamp(details["time"], tz=timezone.utc).strftime(
         "%Y-%m-%d %H:%M UTC"
     )
     direction = details["direction"]
@@ -147,48 +136,52 @@ async def send_alert(details: dict):
 
 
 async def handle_kline_message(raw: str):
-    """Process incoming kline WebSocket messages from OKX."""
+    """Process incoming kline WebSocket messages from MEXC."""
     try:
         msg = json.loads(raw)
     except json.JSONDecodeError:
         return
 
-    # OKX sends a "event" field for subscription confirmations, ignore those
-    if "event" in msg:
+    # MEXC push format: {"channel":"push.kline","data":{...}}
+    channel = msg.get("channel", "")
+    if channel != "push.kline":
         return
 
-    arg = msg.get("arg", {})
-    if not arg.get("channel", "").startswith("candle"):
-        return
-
-    data = msg.get("data", [])
+    data = msg.get("data")
     if not data:
         return
 
-    # OKX candle format: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
-    kline = data[0]
-    symbol = arg.get("instId")
+    symbol = data.get("symbol")
     if not symbol:
         return
 
-    # Only process confirmed (closed) candles
-    # confirm: "1" = closed, "0" = still forming
-    if len(kline) < 9 or kline[8] != "1":
-        return
-
     candle = {
-        "time": int(kline[0]),
-        "open": float(kline[1]),
-        "high": float(kline[2]),
-        "low": float(kline[3]),
-        "close": float(kline[4]),
+        "time": data.get("t"),  # MEXC sends seconds
+        "open": float(data.get("o", 0)),
+        "high": float(data.get("h", 0)),
+        "low": float(data.get("l", 0)),
+        "close": float(data.get("c", 0)),
     }
 
     store = candle_store.setdefault(symbol, [])
 
-    # Avoid duplicate entries for the same closed candle
+    # If the same candle timestamp is received, it's still forming.
+    # Replace it so our last entry is always the newest.
     if store and store[-1]["time"] == candle["time"]:
+        store[-1] = candle
         return
+    else:
+        # A new candle has started. The previous one is now closed.
+        if store:
+            # Run detection on the just-closed candle
+            if len(store) >= LOOKBACK + ATR_PERIOD + 2:
+                result = detect_liquidity_sweep(symbol, store)
+                if result:
+                    bar_index = len(store)
+                    last = last_alert_bar.get(symbol, -999)
+                    if bar_index - last >= COOLDOWN_BARS:
+                        last_alert_bar[symbol] = bar_index
+                        asyncio.create_task(send_alert(result))
 
     store.append(candle)
 
@@ -196,30 +189,19 @@ async def handle_kline_message(raw: str):
     if len(store) > 100:
         candle_store[symbol] = store[-100:]
 
-    # Evaluate the newest closed candle
-    if len(store) >= LOOKBACK + ATR_PERIOD + 2:
-        result = detect_liquidity_sweep(symbol, store)
-        if result:
-            bar_index = len(store)
-            last = last_alert_bar.get(symbol, -999)
-            if bar_index - last >= COOLDOWN_BARS:
-                last_alert_bar[symbol] = bar_index
-                asyncio.create_task(send_alert(result))
-
 
 async def subscribe_symbols(symbols: list[str]):
-    """Connect to OKX WebSocket and subscribe to 1H klines."""
-    async with websockets.connect(OKX_WS_URL, ping_interval=20) as ws:
-        # OKX allows batching multiple channels in one subscribe request.
-        # Build subscription args for all symbols.
-        args = []
+    """Connect to MEXC WebSocket and subscribe to 1H klines."""
+    async with websockets.connect(MEXC_FUTURES_WS, ping_interval=20) as ws:
+        # Subscribe to kline streams
         for sym in symbols:
-            args.append({"channel": f"candle{TIMEFRAME}", "instId": sym})
+            sub_msg = {
+                "method": "sub.kline",
+                "param": {"symbol": sym, "interval": TIMEFRAME},
+            }
+            await ws.send(json.dumps(sub_msg))
+            await asyncio.sleep(0.05)  # avoid rate-limit bursts
 
-        # OKX limits total subscribe/unsubscribe/login to 480 per connection.
-        # Sending one large batch is most efficient.
-        sub_msg = {"op": "subscribe", "args": args}
-        await ws.send(json.dumps(sub_msg))
         print(f"[+] Subscribed to {len(symbols)} symbols on {TIMEFRAME}")
 
         # Listen for messages
@@ -229,7 +211,7 @@ async def subscribe_symbols(symbols: list[str]):
                 await handle_kline_message(raw)
             except asyncio.TimeoutError:
                 # Send ping to keep alive
-                await ws.send(json.dumps({"op": "ping"}))
+                await ws.send(json.dumps({"method": "ping"}))
             except websockets.ConnectionClosed:
                 print("[!] WebSocket closed. Reconnecting...")
                 break
@@ -258,6 +240,7 @@ async def start_web_server():
     app.router.add_get("/", health_check)
     runner = web.AppRunner(app)
     await runner.setup()
+    # Render provides PORT environment variable (default 10000)
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()

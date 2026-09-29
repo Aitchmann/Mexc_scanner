@@ -14,6 +14,7 @@ from telegram.constants import ParseMode
 # ── CONFIG (read from Render Environment Variables) ─────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+PROXY_URL = os.environ.get("PROXY_URL")
 
 MEXC_FUTURES_WS = "wss://contract.mexc.com/ws"
 MEXC_TICKERS_URL = "https://contract.mexc.com/api/v1/contract/ticker"
@@ -28,6 +29,8 @@ TOP_N = 120
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
     raise ValueError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set.")
+if not PROXY_URL:
+    raise ValueError("PROXY_URL environment variable must be set. Check Render settings.")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
@@ -37,8 +40,11 @@ last_alert_bar: dict[str, int] = {}
 
 
 def fetch_top_symbols(n: int = TOP_N) -> list[str]:
-    """Return top N perpetual symbols by 24h volume from MEXC."""
-    resp = requests.get(MEXC_TICKERS_URL, timeout=10)
+    """Return top N perpetual symbols by 24h volume from MEXC via Cloudflare Proxy."""
+    # Construct the proxied URL
+    proxied_url = f"{PROXY_URL}/?target={MEXC_TICKERS_URL}"
+    
+    resp = requests.get(proxied_url, timeout=15)
     resp.raise_for_status()
     data = resp.json()
     tickers = data.get("data", [])
@@ -191,8 +197,11 @@ async def handle_kline_message(raw: str):
 
 
 async def subscribe_symbols(symbols: list[str]):
-    """Connect to MEXC WebSocket and subscribe to 1H klines."""
-    async with websockets.connect(MEXC_FUTURES_WS, ping_interval=20) as ws:
+    """Connect to MEXC WebSocket via Cloudflare Worker proxy."""
+    # Construct the proxied WebSocket URL
+    proxied_ws_url = f"{PROXY_URL}/?target={MEXC_FUTURES_WS}"
+
+    async with websockets.connect(proxied_ws_url, ping_interval=20) as ws:
         # Subscribe to kline streams
         for sym in symbols:
             sub_msg = {

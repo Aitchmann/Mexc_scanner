@@ -22,7 +22,7 @@ MEXC_TICKERS_URL = "https://contract.mexc.com/api/v1/contract/ticker"
 TIMEFRAME = "Min60"          # 1-hour candles (MEXC uses Min60)
 LOOKBACK = 20                # bars to find swing high/low
 ATR_PERIOD = 14
-ATR_MULTIPLIER = 0.3         # wick must exceed this × ATR
+ATR_MULTIPLIER = 0.01         # wick must exceed this × ATR
 COOLDOWN_BARS = 3            # bars before re-alerting same symbol
 TOP_N = 120                  # You changed this to 120
 # ────────────────────────────────────────────────────────

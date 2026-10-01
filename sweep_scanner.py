@@ -20,10 +20,10 @@ PROXY_URL = os.environ.get("PROXY_URL")
 MEXC_FUTURES_WS = "wss://contract.mexc.com/ws"
 MEXC_TICKERS_URL = "https://contract.mexc.com/api/v1/contract/ticker"
 
-TIMEFRAME = "Min60"          # 1-hour candles (MEXC uses Min60)
+TIMEFRAME = "Min15"          # 1-hour candles (MEXC uses Min60)
 LOOKBACK = 20                # bars to find swing high/low
 ATR_PERIOD = 14
-ATR_MULTIPLIER = 0.2         # You changed this to 0.2
+ATR_MULTIPLIER = 0.01         # You changed this to 0.2
 COOLDOWN_BARS = 3            # bars before re-alerting same symbol
 TOP_N = 80                   # You changed this to 80
 # ────────────────────────────────────────────────────────

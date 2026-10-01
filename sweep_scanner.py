@@ -104,7 +104,7 @@ async def bootstrap_history(symbols: list[str]):
             print(f"[+] Bootstrapped {len(candles)} candles for {sym}")
             
             # Small delay to avoid hitting rate limits during the bulk fetch
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.6)
             
         except Exception as e:
             print(f"[!] Failed to bootstrap {sym}: {e}")

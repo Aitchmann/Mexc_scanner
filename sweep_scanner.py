@@ -20,15 +20,14 @@ PROXY_URL = os.environ.get("PROXY_URL")
 MEXC_FUTURES_WS = "wss://contract.mexc.com/ws"
 MEXC_TICKERS_URL = "https://contract.mexc.com/api/v1/contract/ticker"
 
-TIMEFRAME = "Min15"          # 1-hour candles (MEXC uses Min60)
-LOOKBACK = 20                # bars to find swing high/low
+TIMEFRAME = "Min15"          # CHANGED TO 15m FOR TESTING
+LOOKBACK = 20
 ATR_PERIOD = 14
-ATR_MULTIPLIER = 0.01         # You changed this to 0.2
-COOLDOWN_BARS = 3            # bars before re-alerting same symbol
-TOP_N = 80                   # You changed this to 80
+ATR_MULTIPLIER = 0.01        # CHANGED FOR TESTING
+COOLDOWN_BARS = 3
+TOP_N = 80
 # ────────────────────────────────────────────────────────
 
-# Full browser headers to bypass MEXC's Web Application Firewall
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -42,19 +41,16 @@ HTTP_HEADERS = {
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
     raise ValueError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set.")
 if not PROXY_URL:
-    raise ValueError("PROXY_URL environment variable must be set. Check Render settings.")
+    raise ValueError("PROXY_URL environment variable must be set.")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# In-memory candle store
 candle_store: dict[str, list[dict]] = {}
 last_alert_bar: dict[str, int] = {}
 
 
 def fetch_top_symbols(n: int = TOP_N) -> list[str]:
-    """Return top N perpetual symbols by 24h volume from MEXC via Cloudflare Proxy."""
     proxied_url = f"{PROXY_URL}/?target={MEXC_TICKERS_URL}"
-    
     resp = requests.get(proxied_url, headers=HTTP_HEADERS, timeout=15)
     resp.raise_for_status()
     data = resp.json()
@@ -66,14 +62,10 @@ def fetch_top_symbols(n: int = TOP_N) -> list[str]:
 
 
 async def bootstrap_history(symbols: list[str]):
-    """Fetch historical 1H candles for all symbols to prime the memory instantly."""
     print(f"[*] Bootstrapping historical candles for {len(symbols)} symbols...")
-    
     for sym in symbols:
         try:
-            # MEXC historical kline endpoint (limit 50 to cover the 36 needed)
             kline_url = f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval={TIMEFRAME}&limit=50"
-            # URL-encode the target so the nested '?' doesn't break the proxy query string
             encoded_target = urllib.parse.quote(kline_url, safe='')
             proxied_url = f"{PROXY_URL}/?target={encoded_target}"
             
@@ -102,8 +94,6 @@ async def bootstrap_history(symbols: list[str]):
             
             candle_store[sym] = candles
             print(f"[+] Bootstrapped {len(candles)} candles for {sym}")
-            
-            # Small delay to avoid hitting rate limits during the bulk fetch
             await asyncio.sleep(0.6)
             
         except Exception as e:
@@ -113,7 +103,6 @@ async def bootstrap_history(symbols: list[str]):
 
 
 def compute_atr(candles: list[dict], period: int = ATR_PERIOD) -> float:
-    """Compute ATR from a list of candles."""
     if len(candles) < period + 1:
         return 0.0
     df = pd.DataFrame(candles[-period - 1:])
@@ -128,7 +117,6 @@ def compute_atr(candles: list[dict], period: int = ATR_PERIOD) -> float:
 
 
 def detect_liquidity_sweep(symbol: str, candles: list[dict]) -> dict | None:
-    """Check the most recently closed candle for a liquidity sweep."""
     if len(candles) < LOOKBACK + ATR_PERIOD + 2:
         return None
     current = candles[-1]
@@ -166,29 +154,30 @@ def detect_liquidity_sweep(symbol: str, candles: list[dict]) -> dict | None:
 
 
 async def send_alert(details: dict):
-    """Send a formatted Telegram alert."""
     ts = datetime.fromtimestamp(details["time"], tz=timezone.utc).strftime(
         "%Y-%m-%d %H:%M UTC"
     )
     direction = details["direction"]
     emoji = "🟢" if "BULLISH" in direction else "🔴"
+    
+    # FIXED: Removed Markdown asterisks and backticks. Plain text is safe.
     msg = (
-        f"{emoji} *LIQUIDITY SWEEP DETECTED*\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"*Symbol:* `{details['symbol']}`\n"
-        f"*Direction:* {direction}\n"
-        f"*Swept Level:* `{details['swept_level']:.6f}`\n"
-        f"*Close:* `{details['close']:.6f}`\n"
-        f"*ATR(14):* `{details['atr']:.6f}`\n"
-        f"*Candle Time:* {ts}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"⏱ 1H timeframe"
+        f"{emoji} LIQUIDITY SWEEP DETECTED\n"
+        f"--------------------------\n"
+        f"Symbol: {details['symbol']}\n"
+        f"Direction: {direction}\n"
+        f"Swept Level: {details['swept_level']:.6f}\n"
+        f"Close: {details['close']:.6f}\n"
+        f"ATR(14): {details['atr']:.6f}\n"
+        f"Candle Time: {ts}\n"
+        f"--------------------------\n"
+        f"1H timeframe"
     )
     try:
+        # FIXED: Removed parse_mode entirely to prevent Telegram API rejections
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=msg,
-            parse_mode=ParseMode.MARKDOWN,
         )
         print(f"[ALERT SENT] {details['symbol']} — {direction}")
     except Exception as e:
@@ -196,7 +185,6 @@ async def send_alert(details: dict):
 
 
 async def handle_kline_message(raw: str):
-    """Process incoming kline WebSocket messages from MEXC."""
     try:
         msg = json.loads(raw)
     except json.JSONDecodeError:
@@ -239,13 +227,11 @@ async def handle_kline_message(raw: str):
                         asyncio.create_task(send_alert(result))
 
     store.append(candle)
-
     if len(store) > 100:
         candle_store[symbol] = store[-100:]
 
 
 async def subscribe_symbols(symbols: list[str]):
-    """Connect to MEXC WebSocket via Cloudflare Worker proxy."""
     ws_base = PROXY_URL.replace("https://", "wss://")
     proxied_ws_url = f"{ws_base}/?target={MEXC_FUTURES_WS}"
 
@@ -272,15 +258,25 @@ async def subscribe_symbols(symbols: list[str]):
 
 
 async def main_scanner():
-    """Main scanner loop."""
     while True:
         try:
             symbols = fetch_top_symbols(TOP_N)
-            await bootstrap_history(symbols)  # <-- NEW: Prime the memory instantly
+            await bootstrap_history(symbols)
+            
+            # DIAGNOSTIC: Send a startup message to prove Telegram works
+            try:
+                await bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text="✅ Bot successfully started and connected to MEXC. Monitoring 80 symbols on 15m timeframe."
+                )
+                print("[+] Startup Telegram message sent.")
+            except Exception as e:
+                print(f"[!] Startup Telegram error: {e}")
+
             await subscribe_symbols(symbols)
         except Exception as e:
             print(f"[!] Error: {e}")
-            print("[*] Waiting 60 seconds before retrying to avoid rate limits...")
+            print("[*] Waiting 60 seconds before retrying...")
             await asyncio.sleep(60)
             continue
         print("[*] Reconnecting in 10 seconds...")
@@ -288,12 +284,10 @@ async def main_scanner():
 
 
 async def health_check(request):
-    """Simple health check endpoint for UptimeRobot."""
     return web.Response(text="OK")
 
 
 async def start_web_server():
-    """Start a lightweight web server for health checks."""
     app = web.Application()
     app.router.add_get("/", health_check)
     runner = web.AppRunner(app)
@@ -305,7 +299,6 @@ async def start_web_server():
 
 
 async def main():
-    """Run scanner and web server concurrently."""
     await asyncio.gather(
         main_scanner(),
         start_web_server(),

@@ -1,19 +1,25 @@
-app = "mexc-scanner"
-primary_region = "jnb" # Johannesburg, closest to you
+# fly.toml app configuration file generated for mexc-scanner on 2026-10-05T22:23:26Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'mexc-scanner'
+primary_region = 'ams'
 
 [build]
 
 [env]
-  PORT = "10000"
+  PORT = '10000'
 
 [http_service]
-  internal_port = 10000
+  internal_port = 8080
   force_https = true
-  auto_stop_machines = false # CRITICAL: Prevents the app from sleeping
+  auto_stop_machines = 'off'
   auto_start_machines = true
   min_machines_running = 1
 
 [[vm]]
-  memory = "512mb"
-  cpu_kind = "shared"
+  memory = '512mb'
+  cpu_kind = 'shared'
   cpus = 1
+  memory_mb = 256

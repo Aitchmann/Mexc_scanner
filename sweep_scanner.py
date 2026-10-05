@@ -5,14 +5,13 @@ import os
 import urllib.parse
 from datetime import datetime, timezone
 
-import numpy as np
 import requests
 import websockets
 from aiohttp import web
 from telegram import Bot
 from telegram.constants import ParseMode
 
-# ── CONFIG (read from Render Environment Variables) ─────
+# ── CONFIG (read from Fly.io Environment Variables) ─────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 PROXY_URL = os.environ.get("PROXY_URL")
@@ -100,11 +99,11 @@ async def bootstrap_history(symbols: list[str]):
             print(f"[!] Failed to bootstrap {sym}: {e}")
             
     print("[*] Bootstrap complete. Starting WebSocket subscription...")
-    gc.collect()
+    gc.collect() # Force memory cleanup
 
 
 def compute_atr(candles: list[dict], period: int = ATR_PERIOD) -> float:
-    """Pure Python ATR calculation to save memory (no pandas)."""
+    """Pure Python ATR calculation to save memory (no pandas/numpy)."""
     if len(candles) < period + 1:
         return 0.0
     
@@ -173,7 +172,7 @@ async def send_alert(details: dict):
         f"ATR(14): {details['atr']:.6f}\n"
         f"Candle Time: {ts}\n"
         f"--------------------------\n"
-        f"1H timeframe"
+        f"Timeframe: {TIMEFRAME}"
     )
     try:
         await bot.send_message(
@@ -285,7 +284,7 @@ async def main_scanner():
 
 
 async def health_check(request):
-    gc.collect()
+    gc.collect() # Force memory cleanup every time the health check is pinged
     return web.Response(text="OK")
 
 
@@ -294,6 +293,8 @@ async def start_web_server():
     app.router.add_get("/", health_check)
     runner = web.AppRunner(app)
     await runner.setup()
+    
+    # CRITICAL FIX: Use 0.0.0.0 to bind to all interfaces and read the PORT env var
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()

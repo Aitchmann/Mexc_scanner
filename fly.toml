@@ -1,5 +1,5 @@
 app = "mexc-scanner"
-primary_region = "jnb" # Johannesburg, closest to you
+primary_region = "jnb" # Johannesburg, closest to your location
 
 [build]
 

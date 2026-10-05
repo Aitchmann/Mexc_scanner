@@ -1,11 +1,11 @@
 import asyncio
+import gc
 import json
 import os
 import urllib.parse
 from datetime import datetime, timezone
 
 import numpy as np
-import pandas as pd
 import requests
 import websockets
 from aiohttp import web
@@ -20,12 +20,13 @@ PROXY_URL = os.environ.get("PROXY_URL")
 MEXC_FUTURES_WS = "wss://contract.mexc.com/ws"
 MEXC_TICKERS_URL = "https://contract.mexc.com/api/v1/contract/ticker"
 
-TIMEFRAME = "Min15"          # CHANGED TO 15m FOR TESTING
+TIMEFRAME = "Min15"          # TESTING: Set to 15 minutes
 LOOKBACK = 20
 ATR_PERIOD = 14
-ATR_MULTIPLIER = 0.01        # CHANGED FOR TESTING
+ATR_MULTIPLIER = 0.01        # TESTING: Set to 0.01 to trigger almost instantly
 COOLDOWN_BARS = 3
 TOP_N = 80
+MAX_CANDLES = 50             # Optimized memory footprint
 # ────────────────────────────────────────────────────────
 
 HTTP_HEADERS = {
@@ -44,7 +45,6 @@ if not PROXY_URL:
     raise ValueError("PROXY_URL environment variable must be set.")
 
 bot = Bot(token=TELEGRAM_TOKEN)
-
 candle_store: dict[str, list[dict]] = {}
 last_alert_bar: dict[str, int] = {}
 
@@ -100,20 +100,23 @@ async def bootstrap_history(symbols: list[str]):
             print(f"[!] Failed to bootstrap {sym}: {e}")
             
     print("[*] Bootstrap complete. Starting WebSocket subscription...")
+    gc.collect()
 
 
 def compute_atr(candles: list[dict], period: int = ATR_PERIOD) -> float:
+    """Pure Python ATR calculation to save memory (no pandas)."""
     if len(candles) < period + 1:
         return 0.0
-    df = pd.DataFrame(candles[-period - 1:])
-    df["tr"] = np.maximum(
-        df["high"] - df["low"],
-        np.maximum(
-            abs(df["high"] - df["close"].shift(1)),
-            abs(df["low"] - df["close"].shift(1)),
-        ),
-    )
-    return float(df["tr"].iloc[1:].mean())
+    
+    trs = []
+    for i in range(len(candles) - period, len(candles)):
+        high = candles[i]["high"]
+        low = candles[i]["low"]
+        prev_close = candles[i-1]["close"]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+    
+    return sum(trs) / period
 
 
 def detect_liquidity_sweep(symbol: str, candles: list[dict]) -> dict | None:
@@ -160,7 +163,6 @@ async def send_alert(details: dict):
     direction = details["direction"]
     emoji = "🟢" if "BULLISH" in direction else "🔴"
     
-    # FIXED: Removed Markdown asterisks and backticks. Plain text is safe.
     msg = (
         f"{emoji} LIQUIDITY SWEEP DETECTED\n"
         f"--------------------------\n"
@@ -174,7 +176,6 @@ async def send_alert(details: dict):
         f"1H timeframe"
     )
     try:
-        # FIXED: Removed parse_mode entirely to prevent Telegram API rejections
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=msg,
@@ -227,8 +228,8 @@ async def handle_kline_message(raw: str):
                         asyncio.create_task(send_alert(result))
 
     store.append(candle)
-    if len(store) > 100:
-        candle_store[symbol] = store[-100:]
+    if len(store) > MAX_CANDLES:
+        candle_store[symbol] = store[-MAX_CANDLES:]
 
 
 async def subscribe_symbols(symbols: list[str]):
@@ -267,7 +268,7 @@ async def main_scanner():
             try:
                 await bot.send_message(
                     chat_id=TELEGRAM_CHAT_ID,
-                    text="✅ Bot successfully started and connected to MEXC. Monitoring 80 symbols on 15m timeframe."
+                    text="✅ Bot restarted and connected to MEXC. Entering testing mode on 15m timeframe."
                 )
                 print("[+] Startup Telegram message sent.")
             except Exception as e:
@@ -284,6 +285,7 @@ async def main_scanner():
 
 
 async def health_check(request):
+    gc.collect()
     return web.Response(text="OK")
 
 

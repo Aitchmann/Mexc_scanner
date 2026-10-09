@@ -13,7 +13,7 @@ from telegram.constants import ParseMode
 # ── CONFIG (read from Fly.io Environment Variables) ─────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-# Note: PROXY_URL is NO LONGER NEEDED for Bybit. You can delete it from Fly.io secrets later.
+# Note: PROXY_URL is NO LONGER NEEDED for Bybit.
 
 BYBIT_FUTURES_WS = "wss://stream.bybit.com/v5/public/linear"
 BYBIT_TICKERS_URL = "https://api.bybit.com/v5/market/tickers?category=linear"
@@ -27,6 +27,17 @@ TOP_N = 80
 MAX_CANDLES = 50             # Optimized memory footprint
 # ────────────────────────────────────────────────────────
 
+# CRITICAL FIX: Browser headers to bypass Bybit's WAF (same fix as MEXC)
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.bybit.com/",
+    "Connection": "keep-alive"
+}
+
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
     raise ValueError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set.")
 
@@ -37,7 +48,8 @@ last_alert_time: dict[str, int] = {}
 
 def fetch_top_symbols(n: int = TOP_N) -> list[str]:
     """Fetch top n symbols by 24h turnover from Bybit."""
-    resp = requests.get(BYBIT_TICKERS_URL, timeout=15)
+    # Added headers here
+    resp = requests.get(BYBIT_TICKERS_URL, headers=HTTP_HEADERS, timeout=15)
     resp.raise_for_status()
     data = resp.json()
     
@@ -57,7 +69,8 @@ async def bootstrap_history(symbols: list[str]):
         try:
             # Bybit kline endpoint
             kline_url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={sym}&interval={TIMEFRAME}&limit=50"
-            resp = requests.get(kline_url, timeout=15)
+            # Added headers here
+            resp = requests.get(kline_url, headers=HTTP_HEADERS, timeout=15)
             resp.raise_for_status()
             
             data = resp.json().get("result", {}).get("list", [])
@@ -70,7 +83,7 @@ async def bootstrap_history(symbols: list[str]):
             candles = []
             for k in data:
                 candles.append({
-                    "time": int(k["start"]) // 1000,  # Bybit uses milliseconds, convert to seconds
+                    "time": int(k["start"]) // 1000,  # Convert ms to seconds
                     "open": float(k["open"]),
                     "high": float(k["high"]),
                     "low": float(k["low"]),

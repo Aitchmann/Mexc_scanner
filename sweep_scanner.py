@@ -19,10 +19,10 @@ PROXY_URL = os.environ.get("PROXY_URL")
 MEXC_FUTURES_WS = "wss://contract.mexc.com/ws"
 MEXC_TICKERS_URL = "https://contract.mexc.com/api/v1/contract/ticker"
 
-TIMEFRAME = "Min15"          # TESTING: Set to 15 minutes
+TIMEFRAME = "Min15"          # TESTING: 15-minute candles
 LOOKBACK = 20
 ATR_PERIOD = 14
-ATR_MULTIPLIER = 0.01        # TESTING: Set to 0.01 to trigger almost instantly
+ATR_MULTIPLIER = 0.01        # TESTING: Extremely sensitive
 COOLDOWN_BARS = 3
 TOP_N = 80
 MAX_CANDLES = 50             # Optimized memory footprint
@@ -99,7 +99,7 @@ async def bootstrap_history(symbols: list[str]):
             print(f"[!] Failed to bootstrap {sym}: {e}")
             
     print("[*] Bootstrap complete. Starting WebSocket subscription...")
-    gc.collect() # Force memory cleanup
+    gc.collect()
 
 
 def compute_atr(candles: list[dict], period: int = ATR_PERIOD) -> float:
@@ -258,33 +258,32 @@ async def subscribe_symbols(symbols: list[str]):
 
 
 async def main_scanner():
+    # Fetch symbols and bootstrap history ONLY ONCE at startup
+    symbols = fetch_top_symbols(TOP_N)
+    await bootstrap_history(symbols)
+    
+    # Send heartbeat ONLY ONCE at startup
+    try:
+        await bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text="✅ Bot successfully started and connected to MEXC. Entering testing mode."
+        )
+        print("[+] Startup Telegram message sent.")
+    except Exception as e:
+        print(f"[!] Startup Telegram error: {e}")
+
+    # Keep reconnecting if the WebSocket drops, but DO NOT re-bootstrap
     while True:
         try:
-            symbols = fetch_top_symbols(TOP_N)
-            await bootstrap_history(symbols)
-            
-            # DIAGNOSTIC: Send a startup message to prove Telegram works
-            try:
-                await bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    text="✅ Bot restarted and connected to MEXC. Entering testing mode on 15m timeframe."
-                )
-                print("[+] Startup Telegram message sent.")
-            except Exception as e:
-                print(f"[!] Startup Telegram error: {e}")
-
             await subscribe_symbols(symbols)
         except Exception as e:
-            print(f"[!] Error: {e}")
-            print("[*] Waiting 60 seconds before retrying...")
-            await asyncio.sleep(60)
-            continue
-        print("[*] Reconnecting in 10 seconds...")
-        await asyncio.sleep(10)
+            print(f"[!] WebSocket error: {e}")
+            print("[*] Waiting 10 seconds before reconnecting...")
+            await asyncio.sleep(10)
 
 
 async def health_check(request):
-    gc.collect() # Force memory cleanup every time the health check is pinged
+    gc.collect()
     return web.Response(text="OK")
 
 
@@ -294,7 +293,6 @@ async def start_web_server():
     runner = web.AppRunner(app)
     await runner.setup()
     
-    # CRITICAL FIX: Use 0.0.0.0 to bind to all interfaces and read the PORT env var
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()

@@ -23,7 +23,7 @@ TIMEFRAME = "Min15"          # TESTING: 15-minute candles
 LOOKBACK = 20
 ATR_PERIOD = 14
 ATR_MULTIPLIER = 0.01        # TESTING: Extremely sensitive
-COOLDOWN_BARS = 3
+COOLDOWN_BARS = 3            # 3 bars = 45 minutes on 15m timeframe
 TOP_N = 80
 MAX_CANDLES = 50             # Optimized memory footprint
 # ────────────────────────────────────────────────────────
@@ -45,7 +45,7 @@ if not PROXY_URL:
 
 bot = Bot(token=TELEGRAM_TOKEN)
 candle_store: dict[str, list[dict]] = {}
-last_alert_bar: dict[str, int] = {}
+last_alert_time: dict[str, int] = {}  # FIXED: Now tracks timestamp instead of bar count
 
 
 def fetch_top_symbols(n: int = TOP_N) -> list[str]:
@@ -103,7 +103,6 @@ async def bootstrap_history(symbols: list[str]):
 
 
 def compute_atr(candles: list[dict], period: int = ATR_PERIOD) -> float:
-    """Pure Python ATR calculation to save memory (no pandas/numpy)."""
     if len(candles) < period + 1:
         return 0.0
     
@@ -220,10 +219,13 @@ async def handle_kline_message(raw: str):
             if len(store) >= LOOKBACK + ATR_PERIOD + 2:
                 result = detect_liquidity_sweep(symbol, store)
                 if result:
-                    bar_index = len(store)
-                    last = last_alert_bar.get(symbol, -999)
-                    if bar_index - last >= COOLDOWN_BARS:
-                        last_alert_bar[symbol] = bar_index
+                    current_time = candle["time"]
+                    last_time = last_alert_time.get(symbol, 0)
+                    # Cooldown: 3 bars * 15 min * 60 sec = 2700 seconds
+                    cooldown_seconds = COOLDOWN_BARS * 15 * 60
+                    
+                    if current_time - last_time >= cooldown_seconds:
+                        last_alert_time[symbol] = current_time
                         asyncio.create_task(send_alert(result))
 
     store.append(candle)
@@ -258,11 +260,9 @@ async def subscribe_symbols(symbols: list[str]):
 
 
 async def main_scanner():
-    # Fetch symbols and bootstrap history ONLY ONCE at startup
     symbols = fetch_top_symbols(TOP_N)
     await bootstrap_history(symbols)
     
-    # Send heartbeat ONLY ONCE at startup
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
@@ -272,7 +272,6 @@ async def main_scanner():
     except Exception as e:
         print(f"[!] Startup Telegram error: {e}")
 
-    # Keep reconnecting if the WebSocket drops, but DO NOT re-bootstrap
     while True:
         try:
             await subscribe_symbols(symbols)

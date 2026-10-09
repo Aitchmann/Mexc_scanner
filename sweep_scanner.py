@@ -16,10 +16,10 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 HYPERLIQUID_API_URL = "https://api.hyperliquid.xyz/info"
 HYPERLIQUID_WS_URL = "wss://api.hyperliquid.xyz/ws"
 
-TIMEFRAME = "15m"            # TESTING: 15-minute candles
+TIMEFRAME = "1h"            # TESTING: 15-minute candles
 LOOKBACK = 20
 ATR_PERIOD = 14
-ATR_MULTIPLIER = 0.01        # TESTING: Extremely sensitive
+ATR_MULTIPLIER = 0.2        # TESTING: Extremely sensitive
 COOLDOWN_BARS = 3
 TOP_N = 80
 MAX_CANDLES = 50

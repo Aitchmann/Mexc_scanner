@@ -16,10 +16,10 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 HYPERLIQUID_API_URL = "https://api.hyperliquid.xyz/info"
 HYPERLIQUID_WS_URL = "wss://api.hyperliquid.xyz/ws"
 
-TIMEFRAME = "1h"            # TESTING: 15-minute candles
+TIMEFRAME = "1h"             # PRODUCTION: 1-hour candles
 LOOKBACK = 20
 ATR_PERIOD = 14
-ATR_MULTIPLIER = 0.2        # TESTING: Extremely sensitive
+ATR_MULTIPLIER = 0.2         # PRODUCTION: 0.2 sensitivity
 COOLDOWN_BARS = 3
 TOP_N = 80
 MAX_CANDLES = 50
@@ -34,7 +34,6 @@ last_alert_time: dict[str, int] = {}
 
 
 def fetch_top_symbols(n: int = TOP_N) -> list[str]:
-    """Fetch top n perpetual symbols by 24h volume from Hyperliquid."""
     payload = {"type": "metaAndAssetCtxs"}
     resp = requests.post(HYPERLIQUID_API_URL, json=payload, timeout=15)
     resp.raise_for_status()
@@ -64,6 +63,17 @@ def fetch_top_symbols(n: int = TOP_N) -> list[str]:
 
 async def bootstrap_history(symbols: list[str]):
     print(f"[*] Bootstrapping historical candles for {len(symbols)} symbols...")
+    
+    # FIXED: Calculate the time window based on the actual TIMEFRAME
+    if TIMEFRAME.endswith("m"):
+        minutes = int(TIMEFRAME[:-1])
+    elif TIMEFRAME.endswith("h"):
+        minutes = int(TIMEFRAME[:-1]) * 60
+    else:
+        minutes = 60 # Default to 1 hour
+    
+    time_window_ms = 50 * minutes * 60 * 1000
+    
     for sym in symbols:
         try:
             payload = {
@@ -71,7 +81,7 @@ async def bootstrap_history(symbols: list[str]):
                 "req": {
                     "coin": sym,
                     "interval": TIMEFRAME,
-                    "startTime": int(datetime.now(timezone.utc).timestamp() * 1000) - (50 * 15 * 60 * 1000)
+                    "startTime": int(datetime.now(timezone.utc).timestamp() * 1000) - time_window_ms
                 }
             }
             resp = requests.post(HYPERLIQUID_API_URL, json=payload, timeout=15)
@@ -184,9 +194,6 @@ async def send_alert(details: dict):
 
 
 async def handle_kline_message(raw: str):
-    # DIAGNOSTIC: Print a dot for every message received
-    print(".", end="", flush=True)
-
     try:
         msg = json.loads(raw)
     except json.JSONDecodeError:
@@ -224,7 +231,7 @@ async def handle_kline_message(raw: str):
                 if result:
                     current_time = candle["time"]
                     last_time = last_alert_time.get(symbol, 0)
-                    cooldown_seconds = COOLDOWN_BARS * 15 * 60
+                    cooldown_seconds = COOLDOWN_BARS * 60 * 60
 
                     if current_time - last_time >= cooldown_seconds:
                         last_alert_time[symbol] = current_time
@@ -271,7 +278,7 @@ async def main_scanner():
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text="✅ Bot successfully started on Hyperliquid. Entering testing mode."
+            text="✅ Bot successfully started on Hyperliquid. Production mode active."
         )
         print("[+] Startup Telegram message sent.")
     except Exception as e:

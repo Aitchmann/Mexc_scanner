@@ -8,23 +8,21 @@ import requests
 import websockets
 from aiohttp import web
 from telegram import Bot
-from telegram.constants import ParseMode
 
 # ── CONFIG (read from Fly.io Environment Variables) ─────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-# Note: PROXY_URL is NO LONGER NEEDED. You can delete it from Fly.io secrets.
 
-OKX_WS_URL = "wss://ws.okx.com:8443/ws/v5/public"
-OKX_TICKERS_URL = "https://www.okx.com/api/v5/market/tickers"
+HYPERLIQUID_API_URL = "https://api.hyperliquid.xyz/info"
+HYPERLIQUID_WS_URL = "wss://api.hyperliquid.xyz/ws"
 
-TIMEFRAME = "15"             # TESTING: 15-minute candles (OKX interval code)
+TIMEFRAME = "15m"            # TESTING: 15-minute candles
 LOOKBACK = 20
 ATR_PERIOD = 14
 ATR_MULTIPLIER = 0.01        # TESTING: Extremely sensitive
-COOLDOWN_BARS = 3            # 3 bars = 45 minutes on 15m timeframe
+COOLDOWN_BARS = 3
 TOP_N = 80
-MAX_CANDLES = 50             # Optimized memory footprint
+MAX_CANDLES = 50
 # ────────────────────────────────────────────────────────
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -36,54 +34,70 @@ last_alert_time: dict[str, int] = {}
 
 
 def fetch_top_symbols(n: int = TOP_N) -> list[str]:
-    """Fetch top n perpetual symbols by 24h volume from OKX."""
-    params = {"instType": "SWAP"}
-    resp = requests.get(OKX_TICKERS_URL, params=params, timeout=15)
+    """Fetch top n perpetual symbols by 24h volume from Hyperliquid."""
+    payload = {"type": "metaAndAssetCtxs"}
+    resp = requests.post(HYPERLIQUID_API_URL, json=payload, timeout=15)
     resp.raise_for_status()
     data = resp.json()
 
-    tickers = data.get("data", [])
-    # Filter for USDT-margined perpetuals and sort by 24h volume in USDT
-    usdt_perps = [t for t in tickers if t.get("instId", "").endswith("USDT-SWAP")]
-    usdt_perps.sort(key=lambda x: float(x.get("volCcy24h", 0)), reverse=True)
-    symbols = [t["instId"] for t in usdt_perps[:n]]
-    print(f"[+] Top {n} symbols: {symbols}")
-    return symbols
+    meta = data[0]
+    asset_ctxs = data[1]
+
+    universe = meta.get("universe", [])
+    symbols = []
+    for i, asset in enumerate(universe):
+        if i >= len(asset_ctxs):
+            break
+        ctx = asset_ctxs[i]
+        if asset.get("isDelisted", False):
+            continue
+        symbols.append({
+            "name": asset["name"],
+            "volume": float(ctx.get("dayNtlVlm", 0))
+        })
+
+    symbols.sort(key=lambda x: x["volume"], reverse=True)
+    top_symbols = [s["name"] for s in symbols[:n]]
+    print(f"[+] Top {n} symbols: {top_symbols}")
+    return top_symbols
 
 
 async def bootstrap_history(symbols: list[str]):
     print(f"[*] Bootstrapping historical candles for {len(symbols)} symbols...")
     for sym in symbols:
         try:
-            # OKX kline endpoint
-            kline_url = f"https://www.okx.com/api/v5/market/candles?instId={sym}&bar={TIMEFRAME}m&limit=50"
-            resp = requests.get(kline_url, timeout=15)
+            payload = {
+                "type": "candleSnapshot",
+                "req": {
+                    "coin": sym,
+                    "interval": TIMEFRAME,
+                    "startTime": int(datetime.now(timezone.utc).timestamp() * 1000) - (50 * 15 * 60 * 1000)
+                }
+            }
+            resp = requests.post(HYPERLIQUID_API_URL, json=payload, timeout=15)
             resp.raise_for_status()
-            
-            data = resp.json().get("data", [])
+            data = resp.json()
+
             if not data:
                 continue
-            
-            # OKX returns candles newest first, so reverse to oldest first
-            data.reverse()
-                
+
             candles = []
             for k in data:
                 candles.append({
-                    "time": int(k[0]) // 1000,  # Convert ms to seconds
-                    "open": float(k[1]),
-                    "high": float(k[2]),
-                    "low": float(k[3]),
-                    "close": float(k[4])
+                    "time": int(k["t"]) // 1000,
+                    "open": float(k["o"]),
+                    "high": float(k["h"]),
+                    "low": float(k["l"]),
+                    "close": float(k["c"])
                 })
-            
+
             candle_store[sym] = candles
             print(f"[+] Bootstrapped {len(candles)} candles for {sym}")
-            await asyncio.sleep(0.4) # Respect OKX rate limits
-            
+            await asyncio.sleep(0.2)
+
         except Exception as e:
             print(f"[!] Failed to bootstrap {sym}: {e}")
-            
+
     print("[*] Bootstrap complete. Starting WebSocket subscription...")
     gc.collect()
 
@@ -91,7 +105,7 @@ async def bootstrap_history(symbols: list[str]):
 def compute_atr(candles: list[dict], period: int = ATR_PERIOD) -> float:
     if len(candles) < period + 1:
         return 0.0
-    
+
     trs = []
     for i in range(len(candles) - period, len(candles)):
         high = candles[i]["high"]
@@ -99,7 +113,7 @@ def compute_atr(candles: list[dict], period: int = ATR_PERIOD) -> float:
         prev_close = candles[i-1]["close"]
         tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
         trs.append(tr)
-    
+
     return sum(trs) / period
 
 
@@ -146,7 +160,7 @@ async def send_alert(details: dict):
     )
     direction = details["direction"]
     emoji = "🟢" if "BULLISH" in direction else "🔴"
-    
+
     msg = (
         f"{emoji} LIQUIDITY SWEEP DETECTED\n"
         f"--------------------------\n"
@@ -157,7 +171,7 @@ async def send_alert(details: dict):
         f"ATR(14): {details['atr']:.6f}\n"
         f"Candle Time: {ts}\n"
         f"--------------------------\n"
-        f"Timeframe: {TIMEFRAME}m"
+        f"Timeframe: {TIMEFRAME}"
     )
     try:
         await bot.send_message(
@@ -172,37 +186,30 @@ async def send_alert(details: dict):
 async def handle_kline_message(raw: str):
     # DIAGNOSTIC: Print a dot for every message received
     print(".", end="", flush=True)
-    
+
     try:
         msg = json.loads(raw)
     except json.JSONDecodeError:
         return
 
-    # OKX push format: {"arg": {"channel": "candle15m", "instId": "BTC-USDT-SWAP"}, "data": [[ts, o, h, l, c, ...]]}
-    arg = msg.get("arg", {})
-    if not arg.get("channel", "").startswith(f"candle{TIMEFRAME}"):
+    channel = msg.get("channel", "")
+    if channel != "candle":
         return
 
-    data = msg.get("data", [])
+    data = msg.get("data")
     if not data:
         return
 
-    kline = data[0]
-    symbol = arg.get("instId")
+    symbol = data.get("s")
     if not symbol:
         return
 
-    # OKX candle format: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
-    # Only process confirmed (closed) candles (confirm == "1")
-    if len(kline) < 9 or kline[8] != "1":
-        return
-
     candle = {
-        "time": int(kline[0]) // 1000,  # Convert ms to seconds
-        "open": float(kline[1]),
-        "high": float(kline[2]),
-        "low": float(kline[3]),
-        "close": float(kline[4]),
+        "time": int(data.get("t", 0)) // 1000,
+        "open": float(data.get("o", 0)),
+        "high": float(data.get("h", 0)),
+        "low": float(data.get("l", 0)),
+        "close": float(data.get("c", 0)),
     }
 
     store = candle_store.setdefault(symbol, [])
@@ -218,7 +225,7 @@ async def handle_kline_message(raw: str):
                     current_time = candle["time"]
                     last_time = last_alert_time.get(symbol, 0)
                     cooldown_seconds = COOLDOWN_BARS * 15 * 60
-                    
+
                     if current_time - last_time >= cooldown_seconds:
                         last_alert_time[symbol] = current_time
                         asyncio.create_task(send_alert(result))
@@ -229,22 +236,29 @@ async def handle_kline_message(raw: str):
 
 
 async def subscribe_symbols(symbols: list[str]):
-    print(f"\n[*] Connecting directly to OKX WebSocket...")
-    
-    async with websockets.connect(OKX_WS_URL, ping_interval=20) as ws:
-        # OKX supports batch subscription
-        args = [{"channel": f"candle{TIMEFRAME}m", "instId": sym} for sym in symbols]
-        sub_msg = {"op": "subscribe", "args": args}
-        
-        await ws.send(json.dumps(sub_msg))
-        print(f"\n[+] Subscribed to {len(symbols)} symbols on {TIMEFRAME}m")
+    print(f"\n[*] Connecting directly to Hyperliquid WebSocket...")
+
+    async with websockets.connect(HYPERLIQUID_WS_URL, ping_interval=20) as ws:
+        for sym in symbols:
+            sub_msg = {
+                "method": "subscribe",
+                "subscription": {
+                    "type": "candle",
+                    "coin": sym,
+                    "interval": TIMEFRAME
+                }
+            }
+            await ws.send(json.dumps(sub_msg))
+            await asyncio.sleep(0.05)
+
+        print(f"\n[+] Subscribed to {len(symbols)} symbols on {TIMEFRAME}")
 
         while True:
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=60)
                 await handle_kline_message(raw)
             except asyncio.TimeoutError:
-                await ws.send(json.dumps({"op": "ping"}))
+                await ws.send(json.dumps({"method": "ping"}))
             except websockets.ConnectionClosed:
                 print("\n[!] WebSocket closed. Reconnecting...")
                 break
@@ -253,11 +267,11 @@ async def subscribe_symbols(symbols: list[str]):
 async def main_scanner():
     symbols = fetch_top_symbols(TOP_N)
     await bootstrap_history(symbols)
-    
+
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text="✅ Bot successfully started. Switched to OKX. Entering testing mode."
+            text="✅ Bot successfully started on Hyperliquid. Entering testing mode."
         )
         print("[+] Startup Telegram message sent.")
     except Exception as e:
@@ -282,7 +296,7 @@ async def start_web_server():
     app.router.add_get("/", health_check)
     runner = web.AppRunner(app)
     await runner.setup()
-    
+
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()

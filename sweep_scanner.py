@@ -13,12 +13,12 @@ from telegram.constants import ParseMode
 # ── CONFIG (read from Fly.io Environment Variables) ─────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-# Note: PROXY_URL is NO LONGER NEEDED for Bybit.
+# Note: PROXY_URL is NO LONGER NEEDED. You can delete it from Fly.io secrets.
 
-BYBIT_FUTURES_WS = "wss://stream.bybit.com/v5/public/linear"
-BYBIT_TICKERS_URL = "https://api.bybit.com/v5/market/tickers?category=linear"
+OKX_WS_URL = "wss://ws.okx.com:8443/ws/v5/public"
+OKX_TICKERS_URL = "https://www.okx.com/api/v5/market/tickers"
 
-TIMEFRAME = "15"             # TESTING: 15-minute candles
+TIMEFRAME = "15"             # TESTING: 15-minute candles (OKX interval code)
 LOOKBACK = 20
 ATR_PERIOD = 14
 ATR_MULTIPLIER = 0.01        # TESTING: Extremely sensitive
@@ -26,17 +26,6 @@ COOLDOWN_BARS = 3            # 3 bars = 45 minutes on 15m timeframe
 TOP_N = 80
 MAX_CANDLES = 50             # Optimized memory footprint
 # ────────────────────────────────────────────────────────
-
-# CRITICAL FIX: Browser headers to bypass Bybit's WAF (same fix as MEXC)
-HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.bybit.com/",
-    "Connection": "keep-alive"
-}
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
     raise ValueError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set.")
@@ -47,18 +36,17 @@ last_alert_time: dict[str, int] = {}
 
 
 def fetch_top_symbols(n: int = TOP_N) -> list[str]:
-    """Fetch top n symbols by 24h turnover from Bybit."""
-    # Added headers here
-    resp = requests.get(BYBIT_TICKERS_URL, headers=HTTP_HEADERS, timeout=15)
+    """Fetch top n perpetual symbols by 24h volume from OKX."""
+    params = {"instType": "SWAP"}
+    resp = requests.get(OKX_TICKERS_URL, params=params, timeout=15)
     resp.raise_for_status()
     data = resp.json()
-    
-    tickers = data.get("result", {}).get("list", [])
-    # Filter for USDT perpetuals and sort by turnover24h
-    usdt_perps = [t for t in tickers if t.get("symbol", "").endswith("USDT")]
-    usdt_perps.sort(key=lambda x: float(x.get("turnover24h", 0)), reverse=True)
-    
-    symbols = [t["symbol"] for t in usdt_perps[:n]]
+
+    tickers = data.get("data", [])
+    # Filter for USDT-margined perpetuals and sort by 24h volume in USDT
+    usdt_perps = [t for t in tickers if t.get("instId", "").endswith("USDT-SWAP")]
+    usdt_perps.sort(key=lambda x: float(x.get("volCcy24h", 0)), reverse=True)
+    symbols = [t["instId"] for t in usdt_perps[:n]]
     print(f"[+] Top {n} symbols: {symbols}")
     return symbols
 
@@ -67,32 +55,31 @@ async def bootstrap_history(symbols: list[str]):
     print(f"[*] Bootstrapping historical candles for {len(symbols)} symbols...")
     for sym in symbols:
         try:
-            # Bybit kline endpoint
-            kline_url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={sym}&interval={TIMEFRAME}&limit=50"
-            # Added headers here
-            resp = requests.get(kline_url, headers=HTTP_HEADERS, timeout=15)
+            # OKX kline endpoint
+            kline_url = f"https://www.okx.com/api/v5/market/candles?instId={sym}&bar={TIMEFRAME}m&limit=50"
+            resp = requests.get(kline_url, timeout=15)
             resp.raise_for_status()
             
-            data = resp.json().get("result", {}).get("list", [])
+            data = resp.json().get("data", [])
             if not data:
                 continue
             
-            # Bybit returns candles newest first, so reverse to oldest first
+            # OKX returns candles newest first, so reverse to oldest first
             data.reverse()
                 
             candles = []
             for k in data:
                 candles.append({
-                    "time": int(k["start"]) // 1000,  # Convert ms to seconds
-                    "open": float(k["open"]),
-                    "high": float(k["high"]),
-                    "low": float(k["low"]),
-                    "close": float(k["close"])
+                    "time": int(k[0]) // 1000,  # Convert ms to seconds
+                    "open": float(k[1]),
+                    "high": float(k[2]),
+                    "low": float(k[3]),
+                    "close": float(k[4])
                 })
             
             candle_store[sym] = candles
             print(f"[+] Bootstrapped {len(candles)} candles for {sym}")
-            await asyncio.sleep(0.4) # Respect Bybit rate limits
+            await asyncio.sleep(0.4) # Respect OKX rate limits
             
         except Exception as e:
             print(f"[!] Failed to bootstrap {sym}: {e}")
@@ -191,9 +178,9 @@ async def handle_kline_message(raw: str):
     except json.JSONDecodeError:
         return
 
-    # Bybit push format: {"topic": "kline.15.BTCUSDT", "data": [{...}]}
-    topic = msg.get("topic", "")
-    if not topic.startswith(f"kline.{TIMEFRAME}."):
+    # OKX push format: {"arg": {"channel": "candle15m", "instId": "BTC-USDT-SWAP"}, "data": [[ts, o, h, l, c, ...]]}
+    arg = msg.get("arg", {})
+    if not arg.get("channel", "").startswith(f"candle{TIMEFRAME}"):
         return
 
     data = msg.get("data", [])
@@ -201,14 +188,21 @@ async def handle_kline_message(raw: str):
         return
 
     kline = data[0]
-    symbol = topic.split(".")[-1]  # Extract symbol from topic
-    
+    symbol = arg.get("instId")
+    if not symbol:
+        return
+
+    # OKX candle format: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
+    # Only process confirmed (closed) candles (confirm == "1")
+    if len(kline) < 9 or kline[8] != "1":
+        return
+
     candle = {
-        "time": int(kline["start"]) // 1000,  # Convert ms to seconds
-        "open": float(kline["open"]),
-        "high": float(kline["high"]),
-        "low": float(kline["low"]),
-        "close": float(kline["close"]),
+        "time": int(kline[0]) // 1000,  # Convert ms to seconds
+        "open": float(kline[1]),
+        "high": float(kline[2]),
+        "low": float(kline[3]),
+        "close": float(kline[4]),
     }
 
     store = candle_store.setdefault(symbol, [])
@@ -235,11 +229,11 @@ async def handle_kline_message(raw: str):
 
 
 async def subscribe_symbols(symbols: list[str]):
-    print(f"\n[*] Connecting directly to Bybit WebSocket...")
+    print(f"\n[*] Connecting directly to OKX WebSocket...")
     
-    async with websockets.connect(BYBIT_FUTURES_WS, ping_interval=20) as ws:
-        # Bybit supports batch subscription
-        args = [f"kline.{TIMEFRAME}.{sym}" for sym in symbols]
+    async with websockets.connect(OKX_WS_URL, ping_interval=20) as ws:
+        # OKX supports batch subscription
+        args = [{"channel": f"candle{TIMEFRAME}m", "instId": sym} for sym in symbols]
         sub_msg = {"op": "subscribe", "args": args}
         
         await ws.send(json.dumps(sub_msg))
@@ -263,7 +257,7 @@ async def main_scanner():
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text="✅ Bot successfully started. Switched to Bybit. Entering testing mode."
+            text="✅ Bot successfully started. Switched to OKX. Entering testing mode."
         )
         print("[+] Startup Telegram message sent.")
     except Exception as e:

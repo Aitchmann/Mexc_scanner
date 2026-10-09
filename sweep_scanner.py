@@ -2,7 +2,6 @@ import asyncio
 import gc
 import json
 import os
-import urllib.parse
 from datetime import datetime, timezone
 
 import requests
@@ -14,12 +13,12 @@ from telegram.constants import ParseMode
 # ── CONFIG (read from Fly.io Environment Variables) ─────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-PROXY_URL = os.environ.get("PROXY_URL")
+# Note: PROXY_URL is NO LONGER NEEDED for Bybit. You can delete it from Fly.io secrets later.
 
-MEXC_FUTURES_WS = "wss://contract.mexc.com/ws"
-MEXC_TICKERS_URL = "https://contract.mexc.com/api/v1/contract/ticker"
+BYBIT_FUTURES_WS = "wss://stream.bybit.com/v5/public/linear"
+BYBIT_TICKERS_URL = "https://api.bybit.com/v5/market/tickers?category=linear"
 
-TIMEFRAME = "Min15"          # TESTING: 15-minute candles
+TIMEFRAME = "15"             # TESTING: 15-minute candles
 LOOKBACK = 20
 ATR_PERIOD = 14
 ATR_MULTIPLIER = 0.01        # TESTING: Extremely sensitive
@@ -28,20 +27,8 @@ TOP_N = 80
 MAX_CANDLES = 50             # Optimized memory footprint
 # ────────────────────────────────────────────────────────
 
-HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.mexc.com/",
-    "Connection": "keep-alive"
-}
-
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
     raise ValueError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set.")
-if not PROXY_URL:
-    raise ValueError("PROXY_URL environment variable must be set.")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 candle_store: dict[str, list[dict]] = {}
@@ -49,14 +36,17 @@ last_alert_time: dict[str, int] = {}
 
 
 def fetch_top_symbols(n: int = TOP_N) -> list[str]:
-    # Keep using the proxy for the REST API (it works perfectly)
-    proxied_url = f"{PROXY_URL}/?target={MEXC_TICKERS_URL}"
-    resp = requests.get(proxied_url, headers=HTTP_HEADERS, timeout=15)
+    """Fetch top n symbols by 24h turnover from Bybit."""
+    resp = requests.get(BYBIT_TICKERS_URL, timeout=15)
     resp.raise_for_status()
     data = resp.json()
-    tickers = data.get("data", [])
-    tickers.sort(key=lambda x: float(x.get("volume24", 0)), reverse=True)
-    symbols = [t["symbol"] for t in tickers[:n]]
+    
+    tickers = data.get("result", {}).get("list", [])
+    # Filter for USDT perpetuals and sort by turnover24h
+    usdt_perps = [t for t in tickers if t.get("symbol", "").endswith("USDT")]
+    usdt_perps.sort(key=lambda x: float(x.get("turnover24h", 0)), reverse=True)
+    
+    symbols = [t["symbol"] for t in usdt_perps[:n]]
     print(f"[+] Top {n} symbols: {symbols}")
     return symbols
 
@@ -65,36 +55,31 @@ async def bootstrap_history(symbols: list[str]):
     print(f"[*] Bootstrapping historical candles for {len(symbols)} symbols...")
     for sym in symbols:
         try:
-            kline_url = f"https://contract.mexc.com/api/v1/contract/kline/{sym}?interval={TIMEFRAME}&limit=50"
-            encoded_target = urllib.parse.quote(kline_url, safe='')
-            proxied_url = f"{PROXY_URL}/?target={encoded_target}"
-            
-            resp = requests.get(proxied_url, headers=HTTP_HEADERS, timeout=15)
+            # Bybit kline endpoint
+            kline_url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={sym}&interval={TIMEFRAME}&limit=50"
+            resp = requests.get(kline_url, timeout=15)
             resp.raise_for_status()
-            data = resp.json().get("data", {})
             
-            times = data.get("time", [])
-            opens = data.get("open", [])
-            highs = data.get("high", [])
-            lows = data.get("low", [])
-            closes = data.get("close", [])
-            
-            if not times:
+            data = resp.json().get("result", {}).get("list", [])
+            if not data:
                 continue
+            
+            # Bybit returns candles newest first, so reverse to oldest first
+            data.reverse()
                 
             candles = []
-            for i in range(len(times)):
+            for k in data:
                 candles.append({
-                    "time": int(times[i]),
-                    "open": float(opens[i]),
-                    "high": float(highs[i]),
-                    "low": float(lows[i]),
-                    "close": float(closes[i])
+                    "time": int(k["start"]) // 1000,  # Bybit uses milliseconds, convert to seconds
+                    "open": float(k["open"]),
+                    "high": float(k["high"]),
+                    "low": float(k["low"]),
+                    "close": float(k["close"])
                 })
             
             candle_store[sym] = candles
             print(f"[+] Bootstrapped {len(candles)} candles for {sym}")
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(0.4) # Respect Bybit rate limits
             
         except Exception as e:
             print(f"[!] Failed to bootstrap {sym}: {e}")
@@ -172,7 +157,7 @@ async def send_alert(details: dict):
         f"ATR(14): {details['atr']:.6f}\n"
         f"Candle Time: {ts}\n"
         f"--------------------------\n"
-        f"Timeframe: {TIMEFRAME}"
+        f"Timeframe: {TIMEFRAME}m"
     )
     try:
         await bot.send_message(
@@ -193,24 +178,24 @@ async def handle_kline_message(raw: str):
     except json.JSONDecodeError:
         return
 
-    channel = msg.get("channel", "")
-    if channel != "push.kline":
+    # Bybit push format: {"topic": "kline.15.BTCUSDT", "data": [{...}]}
+    topic = msg.get("topic", "")
+    if not topic.startswith(f"kline.{TIMEFRAME}."):
         return
 
-    data = msg.get("data")
+    data = msg.get("data", [])
     if not data:
         return
 
-    symbol = data.get("symbol")
-    if not symbol:
-        return
-
+    kline = data[0]
+    symbol = topic.split(".")[-1]  # Extract symbol from topic
+    
     candle = {
-        "time": data.get("t"),
-        "open": float(data.get("o", 0)),
-        "high": float(data.get("h", 0)),
-        "low": float(data.get("l", 0)),
-        "close": float(data.get("c", 0)),
+        "time": int(kline["start"]) // 1000,  # Convert ms to seconds
+        "open": float(kline["open"]),
+        "high": float(kline["high"]),
+        "low": float(kline["low"]),
+        "close": float(kline["close"]),
     }
 
     store = candle_store.setdefault(symbol, [])
@@ -237,26 +222,22 @@ async def handle_kline_message(raw: str):
 
 
 async def subscribe_symbols(symbols: list[str]):
-    # DIRECT CONNECTION: Bypass Cloudflare proxy for WebSocket
-    print(f"\n[*] Bypassing Cloudflare proxy. Connecting directly to MEXC WebSocket...")
+    print(f"\n[*] Connecting directly to Bybit WebSocket...")
     
-    async with websockets.connect(MEXC_FUTURES_WS, ping_interval=20) as ws:
-        for sym in symbols:
-            sub_msg = {
-                "method": "sub.kline",
-                "param": {"symbol": sym, "interval": TIMEFRAME},
-            }
-            await ws.send(json.dumps(sub_msg))
-            await asyncio.sleep(0.05)
-
-        print(f"\n[+] Subscribed to {len(symbols)} symbols on {TIMEFRAME}")
+    async with websockets.connect(BYBIT_FUTURES_WS, ping_interval=20) as ws:
+        # Bybit supports batch subscription
+        args = [f"kline.{TIMEFRAME}.{sym}" for sym in symbols]
+        sub_msg = {"op": "subscribe", "args": args}
+        
+        await ws.send(json.dumps(sub_msg))
+        print(f"\n[+] Subscribed to {len(symbols)} symbols on {TIMEFRAME}m")
 
         while True:
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=60)
                 await handle_kline_message(raw)
             except asyncio.TimeoutError:
-                await ws.send(json.dumps({"method": "ping"}))
+                await ws.send(json.dumps({"op": "ping"}))
             except websockets.ConnectionClosed:
                 print("\n[!] WebSocket closed. Reconnecting...")
                 break
@@ -269,7 +250,7 @@ async def main_scanner():
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text="✅ Bot successfully started. Bypassing proxy for WebSocket. Entering testing mode."
+            text="✅ Bot successfully started. Switched to Bybit. Entering testing mode."
         )
         print("[+] Startup Telegram message sent.")
     except Exception as e:

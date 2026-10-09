@@ -45,7 +45,7 @@ if not PROXY_URL:
 
 bot = Bot(token=TELEGRAM_TOKEN)
 candle_store: dict[str, list[dict]] = {}
-last_alert_time: dict[str, int] = {}  # FIXED: Now tracks timestamp instead of bar count
+last_alert_time: dict[str, int] = {}
 
 
 def fetch_top_symbols(n: int = TOP_N) -> list[str]:
@@ -178,12 +178,15 @@ async def send_alert(details: dict):
             chat_id=TELEGRAM_CHAT_ID,
             text=msg,
         )
-        print(f"[ALERT SENT] {details['symbol']} — {direction}")
+        print(f"\n[ALERT SENT] {details['symbol']} — {direction}")
     except Exception as e:
-        print(f"[!] Telegram error: {e}")
+        print(f"\n[!] Telegram error: {e}")
 
 
 async def handle_kline_message(raw: str):
+    # DIAGNOSTIC: Print a dot for every message received
+    print(".", end="", flush=True)
+    
     try:
         msg = json.loads(raw)
     except json.JSONDecodeError:
@@ -221,7 +224,6 @@ async def handle_kline_message(raw: str):
                 if result:
                     current_time = candle["time"]
                     last_time = last_alert_time.get(symbol, 0)
-                    # Cooldown: 3 bars * 15 min * 60 sec = 2700 seconds
                     cooldown_seconds = COOLDOWN_BARS * 15 * 60
                     
                     if current_time - last_time >= cooldown_seconds:
@@ -246,7 +248,7 @@ async def subscribe_symbols(symbols: list[str]):
             await ws.send(json.dumps(sub_msg))
             await asyncio.sleep(0.05)
 
-        print(f"[+] Subscribed to {len(symbols)} symbols on {TIMEFRAME}")
+        print(f"\n[+] Subscribed to {len(symbols)} symbols on {TIMEFRAME}")
 
         while True:
             try:
@@ -255,7 +257,7 @@ async def subscribe_symbols(symbols: list[str]):
             except asyncio.TimeoutError:
                 await ws.send(json.dumps({"method": "ping"}))
             except websockets.ConnectionClosed:
-                print("[!] WebSocket closed. Reconnecting...")
+                print("\n[!] WebSocket closed. Reconnecting...")
                 break
 
 
@@ -276,7 +278,7 @@ async def main_scanner():
         try:
             await subscribe_symbols(symbols)
         except Exception as e:
-            print(f"[!] WebSocket error: {e}")
+            print(f"\n[!] WebSocket error: {e}")
             print("[*] Waiting 10 seconds before reconnecting...")
             await asyncio.sleep(10)
 

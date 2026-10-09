@@ -49,6 +49,7 @@ last_alert_time: dict[str, int] = {}
 
 
 def fetch_top_symbols(n: int = TOP_N) -> list[str]:
+    # Keep using the proxy for the REST API (it works perfectly)
     proxied_url = f"{PROXY_URL}/?target={MEXC_TICKERS_URL}"
     resp = requests.get(proxied_url, headers=HTTP_HEADERS, timeout=15)
     resp.raise_for_status()
@@ -236,10 +237,10 @@ async def handle_kline_message(raw: str):
 
 
 async def subscribe_symbols(symbols: list[str]):
-    ws_base = PROXY_URL.replace("https://", "wss://")
-    proxied_ws_url = f"{ws_base}/?target={MEXC_FUTURES_WS}"
-
-    async with websockets.connect(proxied_ws_url, ping_interval=20) as ws:
+    # DIRECT CONNECTION: Bypass Cloudflare proxy for WebSocket
+    print(f"\n[*] Bypassing Cloudflare proxy. Connecting directly to MEXC WebSocket...")
+    
+    async with websockets.connect(MEXC_FUTURES_WS, ping_interval=20) as ws:
         for sym in symbols:
             sub_msg = {
                 "method": "sub.kline",
@@ -268,7 +269,7 @@ async def main_scanner():
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text="✅ Bot successfully started and connected to MEXC. Entering testing mode."
+            text="✅ Bot successfully started. Bypassing proxy for WebSocket. Entering testing mode."
         )
         print("[+] Startup Telegram message sent.")
     except Exception as e:

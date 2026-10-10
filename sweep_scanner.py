@@ -19,7 +19,7 @@ HYPERLIQUID_WS_URL = "wss://api.hyperliquid.xyz/ws"
 TIMEFRAME = "1h"             # PRODUCTION: 1-hour candles
 LOOKBACK = 20
 ATR_PERIOD = 14
-ATR_MULTIPLIER = 0.2         # PRODUCTION: 0.2 sensitivity
+ATR_MULTIPLIER = 0.3         # Stricter filter (30% of ATR)
 COOLDOWN_BARS = 3
 TOP_N = 80
 MAX_CANDLES = 50
@@ -64,13 +64,12 @@ def fetch_top_symbols(n: int = TOP_N) -> list[str]:
 async def bootstrap_history(symbols: list[str]):
     print(f"[*] Bootstrapping historical candles for {len(symbols)} symbols...")
     
-    # FIXED: Calculate the time window based on the actual TIMEFRAME
     if TIMEFRAME.endswith("m"):
         minutes = int(TIMEFRAME[:-1])
     elif TIMEFRAME.endswith("h"):
         minutes = int(TIMEFRAME[:-1]) * 60
     else:
-        minutes = 60 # Default to 1 hour
+        minutes = 60
     
     time_window_ms = 50 * minutes * 60 * 1000
     
@@ -138,29 +137,37 @@ def detect_liquidity_sweep(symbol: str, candles: list[dict]) -> dict | None:
     if atr == 0:
         return None
 
+    # Bullish sweep (swept low, closed green)
     if current["low"] < swing_low - (atr * ATR_MULTIPLIER):
         if current["close"] > swing_low:
-            return {
-                "symbol": symbol,
-                "direction": "BULLISH SWEEP (swept low)",
-                "swept_level": swing_low,
-                "candle_low": current["low"],
-                "close": current["close"],
-                "atr": round(atr, 6),
-                "time": current["time"],
-            }
+            # Reversal Confirmation: Requires a green candle
+            # This allows both Pin Bars AND Bullish Engulfing Bars
+            if current["close"] > current["open"]:
+                return {
+                    "symbol": symbol,
+                    "direction": "BULLISH SWEEP (swept low)",
+                    "swept_level": swing_low,
+                    "candle_low": current["low"],
+                    "close": current["close"],
+                    "atr": round(atr, 6),
+                    "time": current["time"],
+                }
 
+    # Bearish sweep (swept high, closed red)
     if current["high"] > swing_high + (atr * ATR_MULTIPLIER):
         if current["close"] < swing_high:
-            return {
-                "symbol": symbol,
-                "direction": "BEARISH SWEEP (swept high)",
-                "swept_level": swing_high,
-                "candle_high": current["high"],
-                "close": current["close"],
-                "atr": round(atr, 6),
-                "time": current["time"],
-            }
+            # Reversal Confirmation: Requires a red candle
+            # This allows both Pin Bars AND Bearish Engulfing Bars
+            if current["close"] < current["open"]:
+                return {
+                    "symbol": symbol,
+                    "direction": "BEARISH SWEEP (swept high)",
+                    "swept_level": swing_high,
+                    "candle_high": current["high"],
+                    "close": current["close"],
+                    "atr": round(atr, 6),
+                    "time": current["time"],
+                }
     return None
 
 
@@ -278,7 +285,7 @@ async def main_scanner():
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text="✅ Bot successfully started on Hyperliquid. Production mode active."
+            text="✅ Bot successfully started. ATR 0.3 with Reversal Body Filter (Pin Bar / Engulfing)."
         )
         print("[+] Startup Telegram message sent.")
     except Exception as e:
